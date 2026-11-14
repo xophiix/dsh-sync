@@ -1,6 +1,6 @@
 {
   "name": "@weibaohui/dsh-sync",
-  "version": "0.4.12-gitea.1",
+  "version": "0.4.12-gitea.2",
   "description": "dsh 插件 · 多机同步与多协议备份（Git 分支→PR→合并 / WebDAV / 本地文件夹）。本仓库是 @weibaohui/dsh-sync 的 fork：新增自建 Gitea/Forgejo 的 PR 创建与自动合并。",
   "license": "MIT",
   "keywords": [

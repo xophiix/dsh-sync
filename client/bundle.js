@@ -1336,24 +1336,42 @@ window.__ModuleLoader__.load({
             })
           }
         } catch {}
+        // ── Language ───────────────────────────────────────────────────────────
+        // 不依赖宿主的 locale 服务来选语言：客户端插件拿不到它时，旧代码会静默退回
+        // 英文词典，中文界面上也整页英文。这里自己解析：
+        //   localStorage 显式覆盖 > 宿主 locale=zh > 系统/浏览器语言=zh > en
+        // 需要强制某一语言时，在页面控制台执行：
+        //   localStorage.setItem('dsh-sync:locale', 'zh')   // 或 'en'，然后刷新
+        const isZhTag = (v) => /^zh([-_]|$)/i.test(String(v || ''))
+        const localeOverride = () => {
+          try { return globalThis.localStorage ? localStorage.getItem('dsh-sync:locale') : null } catch { return null }
+        }
+        const resolveDict = () => {
+          const saved = localeOverride()
+          if (saved === 'zh') return ZH
+          if (saved === 'en') return EN
+          try {
+            const snap = ctx.locale && typeof ctx.locale.getSnapshot === 'function' ? ctx.locale.getSnapshot() : null
+            if (snap && isZhTag(snap.active)) return ZH
+          } catch {}
+          try {
+            const nav = globalThis.navigator && ((navigator.languages && navigator.languages[0]) || navigator.language)
+            if (isZhTag(nav)) return ZH
+          } catch {}
+          return EN
+        }
+        const dict = resolveDict()
         let t = (key, vars) => {
-          let out = EN[key] ?? key
+          let out = dict[key] ?? EN[key] ?? key
           if (vars) for (const [k, v] of Object.entries(vars)) out = out.split('{' + k + '}').join(String(v))
           return out
         }
+        // 仍然注册进宿主词典表：设置分区的标题等宿主渲染的文案走那里。
         try {
           if (ctx.locale && typeof ctx.locale.register === 'function') {
             ctx.locale.register(NS, 'zh', ZH)
             ctx.locale.register(NS, 'en', EN)
-            const bound = typeof ctx.locale.bind === 'function' ? ctx.locale.bind(NS) : null
-            if (bound) {
-              t = (key, vars) => {
-                let out = bound(key) || key
-                if (vars) for (const [k, v] of Object.entries(vars)) out = out.split('{' + k + '}').join(String(v))
-                return out
-              }
-              globalThis.__dshSyncLocaleLive = true
-            }
+            globalThis.__dshSyncLocaleLive = true
           }
         } catch (e) { try { console.error('[dsh-sync] locale init:', e) } catch {} }
         ctx.effect(() => {

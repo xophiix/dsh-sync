@@ -63,6 +63,18 @@ dsh plugin --profile web add github:xophiix/dsh-sync#v0.4.12-gitea.1
 > Gitea 的 git over HTTPS 接受 `oauth2:<token>` 作为用户名密码，插件正是这么做的
 > （`GIT_ASKPASS` 注入，token 不进 argv、不落盘）。
 
+## 界面语言
+
+插件设置页跟随「宿主 locale（zh）→ 系统/浏览器语言（zh）→ 英文」的顺序自动选择；
+中文系统上默认就是中文，即使宿主 locale 服务在客户端插件里不可用。
+
+需要强制某一语言时，在页面控制台执行后刷新：
+
+```js
+localStorage.setItem('dsh-sync:locale', 'zh')   // 或 'en'
+localStorage.removeItem('dsh-sync:locale')      // 恢复自动
+```
+
 ## 多机同步时的注意事项
 
 - **插件清单策略建议用「备份」而不是「并集」**：profile 的 `package.json` 里常有
