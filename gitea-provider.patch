@@ -1,0 +1,343 @@
+--- /Users/xophiixxu/.dsh/profiles/desktop/node_modules/@weibaohui/dsh-sync/src/index.js.orig-0.4.11	2026-11-11 21:13:24
++++ dsh-sync-src/src/index.js	2026-11-14 16:59:02
+@@ -595,6 +595,31 @@
+     return { ...r, provider, verified: true, unverified: false }
+   }
+   if (provider.kind === 'generic') {
++    // A self-hosted Gitea/Forgejo does expose a REST API, so its privacy can
++    // be verified for real — no blind "trust me, it's private" dialog needed.
++    const apiBase = await probeGiteaApi(repoUrl)
++    if (apiBase) {
++      const info = await giteaRequest(token, apiBase, 'GET', `/repos/${provider.owner}/${provider.repo}`)
++      if (!info.ok) {
++        return {
++          ok: false, provider, verified: true, unverified: false,
++          error: '无法访问 Gitea 仓库（HTTP ' + info.status + '）：'
++            + ((info.json && (info.json.message || info.json.error)) || info.text.slice(0, 120)),
++        }
++      }
++      if (!(info.json && info.json.private === true)) {
++        return {
++          ok: false, provider, verified: true, unverified: false, isPublic: true,
++          error: '检测到公共仓库（Gitea：' + provider.owner + '/' + provider.repo + '）。'
++            + 'dsh-sync 会同步含凭证的 settings.yaml，必须使用私有仓库。',
++        }
++      }
++      return {
++        ok: true, provider, verified: true, unverified: false,
++        owner: provider.owner, repo: provider.repo,
++        defaultBranch: (info.json && info.json.default_branch) || 'main',
++      }
++    }
+     if (allowUnverified) return { ok: true, provider, verified: false, unverified: true }
+     return {
+       ok: false, provider, verified: false, unverified: true, needConfirm: true, code: 'UNVERIFIED_REPO',
+@@ -647,18 +672,94 @@
+   return { ok: true, owner: parsed.owner, repo: parsed.repo, defaultBranch: r.json && (r.json.default_branch || 'main') }
+ }
+ 
+-async function createPullRequest(token, owner, repo, { head, base, title, body }) {
+-  return gitcodeRequest(token, 'POST', `/repos/${owner}/${repo}/pulls`, { head, base, title: title || 'dsh-sync', body: body || '' })
++// ── Self-hosted Gitea / Forgejo ─────────────────────────────────────────
++//    REST lives at `<origin>/api/v1` and the pull-request surface is
++//    GitHub-shaped (head/base/title/body, `mergeable`, merge via `Do`), so a
++//    single transport covers every self-hosted instance we cannot recognise
++//    by domain. Hosts without such an API keep the push-only path.
++
++const giteaApiCache = new Map()
++const GITEA_PROBE_RETRY_MS = 60 * 1000
++
++function repoOrigin(raw) {
++  try { return new URL(String(raw || '').trim()).origin } catch { return '' }
+ }
+ 
+-async function getPullRequest(token, owner, repo, number) {
+-  return gitcodeRequest(token, 'GET', `/repos/${owner}/${repo}/pulls/${number}`)
++/** Probe `<origin>/api/v1/version`. Gitea/Forgejo answer `{"version":…}`;
++ *  GitLab and plain git hosts 404 there, so the probe doubles as detection.
++ *  Cached per origin: the sync loop asks on every push. */
++async function probeGiteaApi(repoUrl) {
++  const origin = repoOrigin(repoUrl)
++  if (!origin) return null
++  // 命中即用；失败结果只记 60s——偶发网络抖动不该让 PR 永久降级
++  const hit = giteaApiCache.get(origin)
++  if (hit && (hit.apiBase || Date.now() - hit.at < GITEA_PROBE_RETRY_MS)) return hit.apiBase
++  let apiBase = null
++  try {
++    const init = { headers: { Accept: 'application/json' } }
++    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') init.signal = AbortSignal.timeout(5000)
++    const r = await fetch(origin + '/api/v1/version', init)
++    const json = r.ok ? await jsonOrNull(r) : null
++    if (json && json.version) apiBase = origin + '/api/v1'
++  } catch { /* unreachable / not a Gitea — treat as "no PR API" */ }
++  giteaApiCache.set(origin, { apiBase, at: Date.now() })
++  return apiBase
+ }
+ 
+-async function mergePullRequest(token, owner, repo, number, method) {
+-  return gitcodeRequest(token, 'PUT', `/repos/${owner}/${repo}/pulls/${number}/merge`, method ? { merge_method: method } : {})
++async function giteaRequest(token, apiBase, method, path, body) {
++  const init = {
++    method,
++    headers: { Authorization: 'token ' + token, Accept: 'application/json', 'Content-Type': 'application/json' },
++  }
++  if (body !== undefined) init.body = JSON.stringify(body)
++  const r = await fetch(apiBase + path, init)
++  const text = await r.text()
++  let json = null
++  try { json = text === '' ? null : JSON.parse(text) } catch {}
++  return { ok: r.ok, status: r.status, json, text }
++}
++
++/** Resolve the REST target that owns this remote, or null when the host has
++ *  no pull-request API we can drive (SSH-only remotes, plain git servers). */
++async function repoApiTarget(eff) {
++  const repoUrl = (eff && eff.repoUrl) || ''
++  const token = (eff && eff.token) || ''
++  const provider = detectRepoProvider(repoUrl)
++  if (!provider.owner || !provider.repo || !token) return null
++  if (provider.kind === 'gitcode') {
++    return {
++      kind: 'gitcode', provider, owner: provider.owner, repo: provider.repo,
++      req: (method, path, body) => gitcodeRequest(token, method, path, body),
++    }
++  }
++  if (provider.kind !== 'generic') return null
++  const apiBase = await probeGiteaApi(repoUrl)
++  if (!apiBase) return null
++  return {
++    kind: 'gitea', provider, owner: provider.owner, repo: provider.repo, apiBase,
++    req: (method, path, body) => giteaRequest(token, apiBase, method, path, body),
++  }
+ }
+ 
++async function createPullRequest(target, { head, base, title, body }) {
++  return target.req('POST', `/repos/${target.owner}/${target.repo}/pulls`, { head, base, title: title || 'dsh-sync', body: body || '' })
++}
++
++async function getPullRequest(target, number) {
++  return target.req('GET', `/repos/${target.owner}/${target.repo}/pulls/${number}`)
++}
++
++async function mergePullRequest(target, number, method) {
++  if (target.kind === 'gitea') {
++    // Gitea/Forgejo spell the strategy as `Do`; default to a plain merge.
++    return target.req('POST', `/repos/${target.owner}/${target.repo}/pulls/${number}/merge`, {
++      Do: method || 'merge',
++      delete_branch_after_merge: false,
++    })
++  }
++  return target.req('PUT', `/repos/${target.owner}/${target.repo}/pulls/${number}/merge`, method ? { merge_method: method } : {})
++}
++
+ // ── Sync spec: which live roots mirror into which shadow paths ──
+ //    Four toggle groups; a group's sources are only active when its switch
+ //    is on. Built fresh each cycle from the effective settings. `roots` is
+@@ -897,17 +998,31 @@
+ 
+   // 5. push the branch (token in URL, not in config)
+   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
++
++  // 5b. 空仓库首次接入：远端还没有 base 分支时 PR 无从创建（Gitea 直接 404），
++  //     历史里只有这一个提交，把它同时推成 base 分支不存在覆盖风险。
++  const baseHeads = await gitExec(binary, ['ls-remote', '--heads', remote, `refs/heads/${eff.branch}`], repoDir, authEnv).catch(() => '')
++  if (!String(baseHeads || '').trim()) {
++    await gitExec(binary, ['push', remote, `HEAD:refs/heads/${eff.branch}`], repoDir, authEnv)
++    await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
++    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
++    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
++    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
++    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
++    state.lastPushedBranch = branch
++    advancedToMain = true
++    return { pushed: true, merged: true, initialized: true, branch, settingsPreserved }
++  }
+ 
+   // 6. create PR + mergeable check
+   //    未推进到 main 的每个出口（409、冲突 PR、创建/合并抛错）都要恢复基线：否则 HEAD
+   //    停在 sync 分支上，下一轮 fetch/reset 落空时 lastSyncedCommit 会被记成分支 tip，
+   //    与远端 main 分叉 → 全库误判 bothModified 挂账（真机实证）
+   try {
+-    const parsed = parseRepoUrl(eff.repoUrl)
+-    if (!parsed) {
+-      // non-GitCode remote (local test, self-hosted git): push the branch only;
+-      // PR create/merge is GitCode-specific and skipped. Advance shadow onto
+-      // main as the next cycle's pull baseline.
++    const target = await repoApiTarget(eff)
++    if (!target) {
++      // No pull-request API on this host (SSH-only remote / plain git server):
++      // push the branch only. Advance shadow onto main as next cycle's baseline.
+       await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
+       await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+       await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+@@ -918,7 +1033,7 @@
+     }
+     // 同仓库 PR 的 head 就是分支名（`user:branch` 是 fork PR 语法，GitCode 会 400）
+     const prBody = { head: branch, base: eff.branch, title: `dsh-sync ${instanceId}`, body: `Auto sync from ${instanceId}` }
+-    const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, prBody)
++    const prRes = await createPullRequest(target, prBody)
+     if (!prRes.ok) {
+       // 409 = branch already has an open PR (idempotent retry); try to find it
+       if (prRes.status === 409) return { pushed: true, prConflict: true, message: '已有进行中的同步 PR' }
+@@ -928,16 +1043,20 @@
+     state.lastPushedBranch = branch
+     state.lastPrNumber = prNumber
+ 
+-    // 7. mergeable?
++    // 7. mergeable? Gitea/Forgejo 在 detail 请求时才计算 mergeable，刚 push 完常拿到
++    //    null——短轮询几拍再判定，别把「还没算完」当成冲突。
+     let mergeable = false, conflict = false
+-    try {
+-      const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
+-      mergeable = det.ok && det.json && det.json.mergeable === true
+-      conflict = det.ok && det.json && det.json.mergeable === false
+-    } catch {}
++    for (let i = 0; i < 4; i++) {
++      const det = await getPullRequest(target, prNumber).catch(() => null)
++      if (det && det.ok && det.json) {
++        if (det.json.mergeable === true) { mergeable = true; break }
++        if (det.json.mergeable === false) { conflict = true; break }
++      }
++      if (i < 3) await new Promise(r => setTimeout(r, 1200))
++    }
+ 
+     if (mergeable) {
+-      const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
++      const mr = await mergePullRequest(target, prNumber, 'squash')
+       if (!mr.ok) throw new Error(`合并 PR 失败（HTTP ${mr.status}）`)
+       // 合并即删远端 sync 分支（best effort）：不删的话每次同步遗留一个分支，
+       // 真机仓库实测两天积了 970+ 个 sync/* 分支
+@@ -1326,23 +1445,34 @@
+     return { promoted: false, nothingToCommit: true }
+   }
+   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
+-  const parsed = parseRepoUrl(eff.repoUrl)
+-  if (!parsed) {
+-    // 非 GitCode 远端：推分支后把影子基线推进到 main（与 runPush 的 prSkipped 路径一致）
++  // 空仓库首个快照：base 分支还不存在，直接把它推成 base（同 runPush 的首次接入）
++  const snapBase = await gitExec(binary, ['ls-remote', '--heads', remote, `refs/heads/${eff.branch}`], repoDir, authEnv).catch(() => '')
++  if (!String(snapBase || '').trim()) {
++    await gitExec(binary, ['push', remote, `HEAD:refs/heads/${eff.branch}`], repoDir, authEnv)
++    await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
+     await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
+     await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
+     await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
+     state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
++    return { promoted: true, initialized: true, branch }
++  }
++  const target = await repoApiTarget(eff)
++  if (!target) {
++    // 无 PR API 的远端：推分支后把影子基线推进到 main（与 runPush 的 prSkipped 路径一致）
++    await gitExec(binary, ['fetch', remote, eff.branch], repoDir, authEnv).catch(() => {})
++    await gitExec(binary, ['checkout', eff.branch], repoDir).catch(() => {})
++    await gitExec(binary, ['reset', '--hard', 'FETCH_HEAD'], repoDir).catch(() => {})
++    state.lastSyncedCommit = await gitCurrentCommit(binary, repoDir)
+     return { promoted: true, prSkipped: true, branch }
+   }
+-  const prRes = await createPullRequest(eff.token, parsed.owner, parsed.repo, { head: branch, base: eff.branch, title: `dsh-sync snapshot ${instanceId} ${snapName}`, body: 'snapshot → cloud archive' })
++  const prRes = await createPullRequest(target, { head: branch, base: eff.branch, title: `dsh-sync snapshot ${instanceId} ${snapName}`, body: 'snapshot → cloud archive' })
+   if (!prRes.ok) throw new Error(`创建快照 PR 失败（HTTP ${prRes.status}）：${(prRes.json && prRes.json.message) || prRes.text.slice(0, 160)}`)
+   const prNumber = prRes.json && (prRes.json.number || prRes.json.id)
+   let merged = false
+   try {
+-    const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
++    const det = await getPullRequest(target, prNumber)
+     if (det.ok && det.json && det.json.mergeable === true) {
+-      const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
++      const mr = await mergePullRequest(target, prNumber, 'squash')
+       merged = !!mr.ok
+     }
+   } catch {}
+@@ -1803,15 +1933,15 @@
+   const cur = (await gitExec(binary, ['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).catch(() => '')).trim()
+   if (cur !== branch) return { merged: false, reason: `影子仓库当前在 ${cur || 'detached HEAD'}，不在分支 ${branch}（可能被并发同步重置）——请重新发起冲突处理` }
+   await gitExec(binary, ['push', remote, `HEAD:${branch}`], repoDir, authEnv)
+-  const parsed = parseRepoUrl(eff.repoUrl)
+-  if (!parsed) return { merged: true, prSkipped: true }
++  const target = await repoApiTarget(eff)
++  if (!target) return { merged: true, prSkipped: true }
+   // mergeable 是异步计算的：推送前 PR 一直挂着 mergeable=false，GitCode 在 push 后
+   // 才重算——所以每拍先等再查，false 不一票否决，连续到最后仍 false 才判失败
+   let mergeable = false, lastState
+   for (let i = 0; i < pollTries; i++) {
+     await new Promise(r => setTimeout(r, pollGapMs))
+     try {
+-      const det = await getPullRequest(eff.token, parsed.owner, parsed.repo, prNumber)
++      const det = await getPullRequest(target, prNumber)
+       if (det.ok && det.json) {
+         lastState = det.json.mergeable
+         if (det.json.mergeable === true) { mergeable = true; break }
+@@ -1819,7 +1949,7 @@
+     } catch (e) { log(`dsh-sync: PR 轮询失败：${e && e.message}`) }
+   }
+   if (!mergeable) return { merged: false, reason: lastState === false ? 'PR 仍报 mergeable=false（冲突可能未全部解决）' : 'PR mergeable 状态超时未就绪' }
+-  const mr = await mergePullRequest(eff.token, parsed.owner, parsed.repo, prNumber, 'squash')
++  const mr = await mergePullRequest(target, prNumber, 'squash')
+   if (!mr.ok) return { merged: false, reason: `合并 PR 失败（HTTP ${mr.status}）` }
+   // 合并即删远端 sync 分支 + 影子基线推进到 main（与 runPush 合并路径一致）
+   await gitExec(binary, ['push', remote, '--delete', branch], repoDir, authEnv).catch(() => {})
+@@ -2093,7 +2223,7 @@
+   name: 'dsh-sync',
+   inject: ['webServer', 'settings', 'connection'],
+   Config: Config ?? undefined,
+-  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
++  __internals: { syncSpec, defaultRoots, parseRepoUrl, detectRepoProvider, gitUsernameForProvider, checkRepoAccess, providerRepoInfo, gitAuthEnv, askpassPath, writeAskpass, ASKPASS_SH, mirrorLiveToShadow, resolveLivePath, copyTree, gitExec, acquireLock, checkRepoPrivate, gitcodeRequest, giteaRequest, probeGiteaApi, repoOrigin, repoApiTarget, createPullRequest, getPullRequest, mergePullRequest, giteaApiCache, ensureShadowRepo, runPush, runPull, reconcileRemote, gitCurrentCommit, atomicWriteFile, DEFAULT_SYNC_SETTINGS, CONFLICT_PROMPT_ZH, ALIGN_PROMPT_ZH, REMOTE_ALIGN_PROMPT_ZH, substituteParams, prepareConflictTree, finalizeConflictBranch, strategyForPath, STRATEGY_VALUES, snapshotMirrorSpec, sanitizeSnapshotName, pruneLocalSnapshots, promoteSnapshotToCloud, msysPathConvEnv, expandTilde,
+     // remote backup browser（导出供测试）
+     BROWSE_REF, logicalSpec, parseRemotePath, categoryForLogical, pullSafety, parseLsTree, fetchBrowseRef, browseRemote, browseRemoteTree, expandToBlobs, planRemotePull, applyRemotePullPlan,
+     // apiproxy（导出供测试：mock fetch 驱动 wire 形态回归）
+@@ -2778,9 +2908,9 @@
+             const eff = syncSettings()
+             if (eff.conflictMode !== 'ai') { sendJson(res, 403, { error: 'conflictMode 为 manual，AI 冲突处理已关闭（设置页改为「ai」后可用）' }); return }
+             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+-            const conflictProvider = detectRepoProvider(eff.repoUrl)
+-            if (conflictProvider.kind !== 'gitcode') {
+-              sendJson(res, 400, { error: 'AI 冲突处理依赖 PR 流程，目前仅在 GitCode 仓库上可用（当前主机 ' + (conflictProvider.host || '未知') + '）：换用 GitCode 私有仓库，或手动解决分支冲突' })
++            const conflictTarget = await repoApiTarget(eff)
++            if (!conflictTarget) {
++              sendJson(res, 400, { error: 'AI 冲突处理依赖 PR API，当前主机 ' + (detectRepoProvider(eff.repoUrl).host || '未知') + ' 上没有可用的 PR 接口（支持 GitCode 与自建 Gitea/Forgejo）：请手动解决分支冲突' })
+               return
+             }
+             const body = await readJsonBody(req)
+@@ -2892,13 +3022,11 @@
+             await stateLoaded
+             const eff = syncSettings()
+             if (!eff.repoUrl || !eff.token) { sendJson(res, 400, { error: '未配置仓库或令牌' }); return }
+-            const pruneProvider = detectRepoProvider(eff.repoUrl)
+-            if (pruneProvider.kind !== 'gitcode') {
+-              sendJson(res, 400, { error: '清理遗留分支走的是 GitCode PR 列表接口，目前仅支持 GitCode 仓库（当前主机 ' + (pruneProvider.host || '未知') + '）——请到仓库网页端手动删除 sync/* 分支' })
++            const pruneTarget = await repoApiTarget(eff)
++            if (!pruneTarget) {
++              sendJson(res, 400, { error: '清理遗留分支需要 PR 列表接口，当前主机 ' + (detectRepoProvider(eff.repoUrl).host || '未知') + ' 不可用（支持 GitCode 与自建 Gitea/Forgejo）——请到仓库网页端手动删除 sync/* 分支' })
+               return
+             }
+-            const parsed = parseRepoUrl(eff.repoUrl)
+-            if (!parsed) { sendJson(res, 400, { error: '仅支持 GitCode 仓库' }); return }
+             const hasShadow = await fsP.access(join(repoDir, '.git')).then(() => true).catch(() => false)
+             if (!hasShadow) { sendJson(res, 400, { error: '影子仓库未初始化，先同步一次' }); return }
+             const remote = eff.repoUrl, authEnv = gitAuthEnv(eff)
+@@ -2908,9 +3036,23 @@
+             // 收集已合并 PR 的 head 分支（翻页直到取完，上限 20 页 × 100）
+             const mergedHeads = new Set()
+             for (let page = 1; page <= 20; page++) {
+-              const r = await gitcodeRequest(eff.token, 'GET', `/repos/${parsed.owner}/${parsed.repo}/pulls?state=merged&per_page=100&page=${page}`)
++              // Gitea/Forgejo have no state=merged: ask for closed PRs and keep the merged ones
++              const q = pruneTarget.kind === 'gitea'
++                ? `/repos/${pruneTarget.owner}/${pruneTarget.repo}/pulls?state=closed&limit=100&page=${page}`
++                : `/repos/${pruneTarget.owner}/${pruneTarget.repo}/pulls?state=merged&per_page=100&page=${page}`
++              const r = await pruneTarget.req('GET', q)
+               if (!r.ok || !Array.isArray(r.json) || r.json.length === 0) break
+-              for (const pr of r.json) { if (pr.head && pr.head.ref) mergedHeads.add(pr.head.ref) }
++              for (const pr of r.json) {
++                if (!pr.head) continue
++                const merged = pruneTarget.kind === 'gitea' ? (pr.merged === true || !!pr.merged_at) : true
++                if (!merged) continue
++                // Gitea 的 head.ref 在分支被删后是 refs/pull/N/head，真正的分支名在
++                // head.label 里（形如 owner:branch 或直接 branch），两种都归一化。
++                const name = pruneTarget.kind === 'gitea'
++                  ? String(pr.head.label || pr.head.ref || '').replace(/^[^:]+:/, '').replace(/^refs\/heads\//, '')
++                  : String(pr.head.ref || '')
++                if (name && !name.startsWith('refs/pull/')) mergedHeads.add(name)
++              }
+               if (r.json.length < 100) break
+             }
+             const ls = await gitExec(eff.gitBinary, ['ls-remote', '--heads', remote, 'refs/heads/sync/*'], repoDir, authEnv).catch(() => '')
